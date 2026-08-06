@@ -1,22 +1,22 @@
-```markdown
-# 数据模型设计（完整版 v3.0）
+# 数据模型设计（完整版 v4.0）
 
 > **版本更新说明**：
-> - **v2.0 → v3.0**：针对任务5（意图识别、拆解与改写），新增会话上下文表与查询处理日志表，强化用户反馈表对改写环节的追溯能力，并新增Nacos配置组用于意图理解策略热更新。所有新增/修改内容已用 **📌** 标注。
+> - **v3.0 → v4.0**：针对任务6（召回策略：混合检索 + 标签筛选 + 投研融合 + MCP），新增召回日志表以记录多路召回细节（语义/关键词/模糊各通路命中数、RRF参数、延迟、宽松触发），增强用户反馈表对召回环节的追溯能力，并新增Nacos配置组用于混合检索运行时参数热更新。所有新增/修改内容已用 **📌 v4.0** 标注。
+> - **v2.0 → v3.0**：针对任务5（意图识别、拆解与改写），新增会话上下文表与查询处理日志表，强化用户反馈表对改写环节的追溯能力，并新增Nacos配置组用于意图理解策略热更新。
 > - **v1.0 → v2.0**：新增路由日志表与反馈表增强字段，用于支撑全局字典与路由模块的可观测性及端到端闭环。
 
 数据模型设计服务于两个核心场景：**写入**（文档预处理后入库）和**读取**（检索时快速过滤和召回）。整体分为五块：
 
-1. **MySQL**：存储元数据、切块原文、标签、版本、反馈、路由日志、会话上下文、查询日志等结构化数据
+1. **MySQL**：存储元数据、切块原文、标签、版本、反馈、路由日志、会话上下文、查询日志、**召回日志（v4.0新增）** 等结构化数据
 2. **Elasticsearch**：存储切块文本，用于关键词检索（BM25）和元数据过滤
 3. **向量数据库（Milvus）** ：存储切块向量，用于语义检索
-4. **配置中心（Nacos/Apollo）** ：存储全局字典、排序权重、路由运行时参数、意图理解策略等热配置
+4. **配置中心（Nacos/Apollo）** ：存储全局字典、排序权重、路由运行时参数、意图理解策略、**混合检索参数（v4.0新增）** 等热配置
 5. **对象存储（MinIO/OSS）** ：存储原始文档文件及解析缓存
 
 
 ## 一、MySQL 数据模型
 
-一共需要 **10张** 核心表（原8张 + 新增2张）。
+一共需要 **11张** 核心表（原10张 + 新增1张）。
 
 ### 1.1 文档主表：`kb_documents`
 
@@ -89,7 +89,7 @@ CREATE INDEX idx_parent_chunk ON kb_chunks(parent_chunk_id);
 | `tag_category` | varchar(32) | | industry / topic / risk / region / auto_extracted |
 | `is_active` | tinyint | DEFAULT 1 | 是否启用 |
 
-> **📌 说明**：`tag_category` 新增 `auto_extracted` 枚举值，用于标注路由模块自动提取并补齐的标签，便于后续人工审核。
+> **说明**：`tag_category` 已包含 `auto_extracted` 枚举值（v2.0），用于标注路由模块自动提取并补齐的标签。任务6（召回）依赖此表做标签前置校验，验证传入的标签是否存在。
 
 ### 1.4 文档标签关联表：`kb_doc_tag_relation`
 
@@ -118,6 +118,8 @@ CREATE UNIQUE INDEX idx_unique_doc_tag ON kb_doc_tag_relation(doc_id, tag_id);
 CREATE INDEX idx_entity ON kb_entity_mapping(entity_type, entity_code);
 ```
 
+> **任务6使用方式**：查询时用于反向匹配实体代码（如输入“茅台”查得“600519”），并作为 ES/Milvus 的过滤条件（`entity_codes` 字段）。
+
 ### 1.6 版本变更记录表：`kb_version_changes`
 
 | 字段名 | 类型 | 约束 | 描述 |
@@ -129,7 +131,7 @@ CREATE INDEX idx_entity ON kb_entity_mapping(entity_type, entity_code);
 | `status` | tinyint | DEFAULT 0 | 0-待确认 / 1-已合并 |
 | `created_at` | datetime | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
 
-### 1.7 用户反馈表：`kb_user_feedback`（📌 v2.0新增路由字段 + v3.0新增理解层字段）
+### 1.7 用户反馈表：`kb_user_feedback`（📌 v2.0新增路由字段 + v3.0新增理解层字段 + 📌 v4.0新增召回层字段）
 
 | 字段名 | 类型 | 约束 | 描述 |
 | :--- | :--- | :--- | :--- |
@@ -143,15 +145,28 @@ CREATE INDEX idx_entity ON kb_entity_mapping(entity_type, entity_code);
 | `comment` | varchar(500) | | 用户备注 |
 | **`router_snapshot`** 📌 v2.0 | json | NULL | **路由决策快照：{routed_kbs, clarity_flag, confidence}，用于回溯路由是否正确** |
 | **`selected_kb`** 📌 v2.0 | varchar(32) | NULL | **用户实际浏览的知识库（歧义引导场景下用户点击选择的结果）** |
+| **`search_snapshot`** 📌 v4.0 | json | NULL | **召回快照：记录RRF融合后的Top-K `chunk_uuid`列表及各通路得分，用于回溯"召回是否遗漏"** |
+| **`retrieved_chunks`** 📌 v4.0 | json | NULL | **实际返回给用户的 `chunk_uuid` 列表（前N条）** |
+| **`search_helpful`** 📌 v4.0 | tinyint | NULL | **用户点踩时可选：召回的内容是否相关？（1=相关，0=完全不相关）** |
 | `created_at` | datetime | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
 
 > **📌 v2.0 修改原因**（路由层）：用户反馈必须能追溯到“当时的路由决策”，才能区分是“路由错了”还是“检索召回了差文档”还是“排序不好”。`router_snapshot` 与 `kb_router_logs` 存在冗余，但目的是让反馈表自包含，防止日志表清理后丢失关联。**紧迫度：高**。
 >
 > **📌 v3.0 修改原因**（理解层）：用户点踩可能是因为“改写错了”（如“收益”被改成了“到期收益率”，但用户实际问的是“持有期收益”）。必须记录当时的改写结果，否则11月做端到端反馈闭环时，无法区分“检索没召回”和“改写把语义带偏了”。**紧迫度：高**。
+>
+> **📌 v4.0 修改原因**（召回层）：用户点踩还可能是因为“语义没召回相关段落”或“关键词没匹配上”。新增召回快照字段可将反馈精细定位到“召回”这一层，与路由/改写形成完整的三段式追溯链（路由→改写→召回）。**紧迫度：高**。
+
+**DDL 示例（v4.0 新增字段）**：
+```sql
+ALTER TABLE kb_user_feedback 
+ADD COLUMN search_snapshot json NULL COMMENT '召回快照（RRF融合后的Top-K列表及得分）',
+ADD COLUMN retrieved_chunks json NULL COMMENT '返回的chunk_uuid列表',
+ADD COLUMN search_helpful tinyint NULL COMMENT '召回内容是否相关';
+```
 
 ### 1.8 路由日志表：`kb_router_logs`（📌 v2.0新增）
 
-> **📌 新增原因**：路由模块仅在内存中处理，不落库。但第11周的“召回测评”和“端到端反馈闭环”必须依赖历史路由数据来分析：关键词命中率、歧义率、零命中率（评估MD字典覆盖度），以及用户最终选择是否与路由推荐一致。**紧迫度：高**。
+> **新增原因**：路由模块仅在内存中处理，不落库。但第11周的“召回测评”和“端到端反馈闭环”必须依赖历史路由数据来分析：关键词命中率、歧义率、零命中率（评估MD字典覆盖度），以及用户最终选择是否与路由推荐一致。**紧迫度：高**。
 
 | 字段名 | 类型 | 约束 | 描述 |
 | :--- | :--- | :--- | :--- |
@@ -177,7 +192,7 @@ CREATE INDEX idx_clarity ON kb_router_logs(clarity_flag);
 
 ### 1.9 会话上下文表：`kb_sessions`（📌 v3.0新增）
 
-> **📌 新增原因**：任务5需要处理多轮对话中的指代消解（如“它现在的估值呢？”中的“它”）。Dify自身虽维护对话历史，但为了在自研核心中实现轻量级上下文感知改写（避免每次调用LLM时传递完整历史，节省Token），需要一张轻量的会话摘要表。**紧迫度：高**。
+> **新增原因**：任务5需要处理多轮对话中的指代消解（如“它现在的估值呢？”中的“它”）。Dify自身虽维护对话历史，但为了在自研核心中实现轻量级上下文感知改写（避免每次调用LLM时传递完整历史，节省Token），需要一张轻量的会话摘要表。**紧迫度：高**。
 
 | 字段名 | 类型 | 约束 | 描述 |
 | :--- | :--- | :--- | :--- |
@@ -198,7 +213,7 @@ CREATE INDEX idx_source_kb ON kb_sessions(source_kb);
 
 ### 1.10 查询处理日志表：`kb_query_logs`（📌 v3.0新增）
 
-> **📌 新增原因**：现有`kb_router_logs`记录路由决策，但任务5的意图分类、拆解、改写过程需要单独记录。原因有二：一是路由发生在理解之前（先定`source_kb`，再做意图理解）；二是为了后续分析“LLM改写是否有效”与“意图分类是否准确”，必须留存原始输入与最终输出的映射关系，方便做Bad Case分析。**紧迫度：高**。
+> **新增原因**：现有`kb_router_logs`记录路由决策，但任务5的意图分类、拆解、改写过程需要单独记录。原因有二：一是路由发生在理解之前（先定`source_kb`，再做意图理解）；二是为了后续分析“LLM改写是否有效”与“意图分类是否准确”，必须留存原始输入与最终输出的映射关系，方便做Bad Case分析。**紧迫度：高**。
 
 | 字段名 | 类型 | 约束 | 描述 |
 | :--- | :--- | :--- | :--- |
@@ -222,6 +237,53 @@ CREATE INDEX idx_trace ON kb_query_logs(trace_id);
 CREATE INDEX idx_session ON kb_query_logs(session_id);
 CREATE INDEX idx_intent ON kb_query_logs(intent_type);
 CREATE INDEX idx_created ON kb_query_logs(created_at);
+```
+
+### 1.11 召回日志表：`kb_search_logs`（📌 v4.0新增）
+
+> **📌 新增原因**：任务6（混合检索）涉及多路并行召回（语义/关键词/模糊）、RRF融合排序以及宽松召回（Fallback）策略。当前 v3.0 中 `kb_router_logs` 记录路由，`kb_query_logs` 记录改写/意图，但**召回环节完全处于黑盒状态**。若缺失此表，后续做“召回测评”时将无法分析：
+> - 语义通路 vs 关键词通路的命中覆盖率与重叠率；
+> - RRF融合参数（`k`值、各通路权重）是否合理；
+> - 宽松召回触发频率是否过高，是否需要调整阈值；
+> - 各通路延迟是否在可接受范围内。
+>
+> **紧迫度：高**。
+
+| 字段名 | 类型 | 约束 | 描述 |
+| :--- | :--- | :--- | :--- |
+| `id` | bigint | PRIMARY KEY AUTO_INCREMENT | 自增主键 |
+| `trace_id` | varchar(64) | NOT NULL INDEX | 全链路追踪ID（关联 `kb_query_logs` 与 `kb_router_logs`） |
+| `session_id` | varchar(64) | NULL | 会话ID |
+| `original_query` | text | NOT NULL | 用户原始输入（冗余便于排查） |
+| `rewritten_query` | text | NULL | 改写后用于检索的主Query |
+| `sub_questions` | json | NULL | 拆解后的子问题列表 |
+| `tag_filters` | json | NULL | 请求传入的标签筛选条件，如`["财务分析"]` |
+| `entity_constraints` | json | NULL | 请求传入的投研实体代码列表，如`["600519"]` |
+| `source_kb` | varchar(32) | NULL | 路由锁定的知识库 |
+| `semantic_query` | text | NULL | 实际送给Milvus的查询文本（可能经过向量化） |
+| `keyword_query` | text | NULL | 实际送给ES的查询文本（可能是改写后的） |
+| `semantic_top_k` | int | DEFAULT 50 | 语义通路召回数配置 |
+| `keyword_top_k` | int | DEFAULT 50 | 关键词通路召回数配置 |
+| `semantic_hits` | int | NULL | 语义通路实际命中的候选数量 |
+| `keyword_hits` | int | NULL | 关键词通路实际命中的候选数量 |
+| `fuzzy_hits` | int | NULL | 模糊匹配通路实际命中数（若启用） |
+| `overlap_count` | int | NULL | 多路召回之间的重叠文档数 |
+| `rrf_params` | json | NULL | 融合参数快照，如`{"k":60, "semantic_weight":0.6, "keyword_weight":0.3, "fuzzy_weight":0.1}` |
+| `final_result_count` | int | NULL | 最终返回给上游的Top-K数量 |
+| `semantic_latency_ms` | int | NULL | Milvus检索耗时（毫秒） |
+| `keyword_latency_ms` | int | NULL | ES检索耗时（毫秒） |
+| `fusion_latency_ms` | int | NULL | RRF融合排序耗时（毫秒） |
+| `fallback_triggered` | tinyint(1) | DEFAULT 0 | 是否因结果不足触发了宽松召回（如top_k乘2） |
+| `status` | tinyint | DEFAULT 1 | 1=成功 / 0=失败 |
+| `error_msg` | text | NULL | 异常信息（如有） |
+| `created_at` | datetime | DEFAULT CURRENT_TIMESTAMP | 创建时间 |
+
+**索引**：
+```sql
+CREATE INDEX idx_trace ON kb_search_logs(trace_id);
+CREATE INDEX idx_session ON kb_search_logs(session_id);
+CREATE INDEX idx_created ON kb_search_logs(created_at);
+CREATE INDEX idx_status ON kb_search_logs(status);
 ```
 
 
@@ -265,9 +327,9 @@ CREATE INDEX idx_created ON kb_query_logs(created_at);
 }
 ```
 
-> **说明**：ES索引**只存储子块（CHILD）**，不存储父块（PARENT），以控制索引体积。检索时命中子块后，通过MySQL的`parent_chunk_id`拉取父块完整内容。
+> **说明**：ES索引**只存储子块（CHILD）**，不存储父块（PARENT），以控制索引体积。检索时命中子块后，通过MySQL的`parent_chunk_id`拉取父块完整内容。`tags` 和 `entity_codes` 字段用于任务6的标签筛选与投研实体过滤。
 
-### 关键检索查询示例（模块B的ES召回）
+### 关键检索查询示例（任务6的ES召回）
 
 ES承担BM25关键词检索和元数据过滤，典型查询如下：
 
@@ -283,6 +345,7 @@ POST /kb_chunks_v1/_search
         { "terms": { "source_kb": ["信评知识库", "固收投研知识库"] } },
         { "range": { "published_date": { "gte": "2026-01-01" } } },
         { "terms": { "tags": ["#新能源"] } },
+        { "terms": { "entity_codes": ["600519", "110053"] } },
         { "term": { "is_active": true } }
       ]
     }
@@ -305,7 +368,7 @@ POST /kb_chunks_v1/_search
 
 **分区设计**：每个知识库独立分区（如`fund`、`credit`、`compliance`），查询时只扫描相关分区。
 
-**向量检索示例**（模块B的向量召回）：
+**向量检索示例**（任务6的语义召回）：
 ```python
 expr = "source_kb in ['信评知识库', '固收投研知识库'] and is_active == true"
 results = collection.search(
@@ -321,7 +384,7 @@ results = collection.search(
 
 ## 四、配置中心（Nacos）存储内容
 
-全局字典、排序权重、路由运行时参数及意图理解策略放在配置中心，支持运行时修改无需重启。
+全局字典、排序权重、路由运行时参数、意图理解策略及混合检索参数放在配置中心，支持运行时修改无需重启。
 
 ### 4.1 路由规则（静态字典）
 ```yaml
@@ -357,7 +420,7 @@ source_priority:
 
 ### 4.4 路由运行时参数（📌 v2.0新增）
 
-> **📌 新增原因**：将业务字典（MD文件）与运行时阈值参数分离，二者变更频率不同。字典每周由业务方调整，阈值仅在调试/压测时修改，分开存储更清晰。**紧迫度：中**。
+> **新增原因**：将业务字典（MD文件）与运行时阈值参数分离，二者变更频率不同。字典每周由业务方调整，阈值仅在调试/压测时修改，分开存储更清晰。**紧迫度：中**。
 
 ```yaml
 # Data ID: router_runtime.yaml
@@ -371,7 +434,7 @@ router:
 
 ### 4.5 意图理解策略参数（📌 v3.0新增）
 
-> **📌 新增原因**：任务5中的Prompt模板、降级正则、拆解数量上限需要支持热更新。尤其是意图分类的正则兜底规则，业务刚上线时会频繁调整，放在Nacos可避免频繁发版。**紧迫度：中**。
+> **新增原因**：任务5中的Prompt模板、降级正则、拆解数量上限需要支持热更新。尤其是意图分类的正则兜底规则，业务刚上线时会频繁调整，放在Nacos可避免频繁发版。**紧迫度：中**。
 
 ```yaml
 # Data ID: query_understanding.yaml
@@ -393,6 +456,39 @@ fallback_patterns:
     intent: "CALCULATION"
   - pattern: "^(你好|谢谢|在吗|hi|hello).*"
     intent: "CHITCHAT"
+```
+
+### 4.6 混合检索运行时参数（📌 v4.0新增）
+
+> **📌 新增原因**：任务6中RRF（倒数排名融合）的常数`k`、各通路权重（语义/关键词/模糊）、标签匹配模式（exact/any/all）以及宽松召回（Fallback）的阈值，在开发初期需要频繁调参。硬编码会导致发版成本高，放在Nacos可支持运维动态调整，无需重启服务。**紧迫度：中**。
+
+```yaml
+# Data ID: search_hybrid.yaml
+hybrid:
+  # 各通路召回数量
+  semantic_top_k: 50
+  keyword_top_k: 50
+  fuzzy_top_k: 20          # ES 模糊匹配（如 match_phrase_prefix）单独通路
+  
+  # RRF（倒数排名融合）参数
+  rrf:
+    k: 60                  # 常数，通常设为 60
+    semantic_weight: 0.6   # 语义通路权重
+    keyword_weight: 0.3    # 关键词通路权重
+    fuzzy_weight: 0.1      # 模糊通路权重
+  
+  # 标签筛选模式
+  tag_filter:
+    match_mode: "exact"    # exact / any / all
+    # exact: 文档必须包含所有指定标签（精确匹配）
+    # any: 文档包含任意一个指定标签即可
+    # all: 文档必须同时包含全部指定标签
+  
+  # 宽松召回（Fallback）策略
+  fallback:
+    min_results: 3         # 若 RRF 融合后结果少于 3 条，触发宽松召回
+    relax_factor: 2.0      # 将 semantic_top_k 和 keyword_top_k 乘以该系数重试
+    max_retries: 1         # 宽松召回最多重试 1 次，避免性能雪崩
 ```
 
 
@@ -425,9 +521,10 @@ fallback_patterns:
 | **溯源链路** | `kb_chunks.source_elem_ids` → 对象存储 `elements.json` → 提取 `bbox` 坐标 → 前端高亮 |
 | **路由日志闭环** 📌 v2.0 | `kb_router_logs.trace_id` ↔ `kb_user_feedback.trace_id`，实现“路由决策 → 检索召回 → 用户反馈”全链路可追溯 |
 | **查询理解闭环** 📌 v3.0 | `kb_query_logs.trace_id` ↔ `kb_router_logs.trace_id` ↔ `kb_user_feedback.trace_id`，实现“路由 → 意图理解 → 检索 → 反馈”完整链路可追溯 |
+| **召回调优闭环** 📌 v4.0 | `kb_search_logs.trace_id` ↔ `kb_query_logs.trace_id` ↔ `kb_user_feedback.trace_id`，实现“路由 → 意图理解 → 多路召回 → RRF融合 → 反馈”全链路可追溯。`kb_search_logs` 中的 `rrf_params`、各通路 `_hits`、`overlap_count`、`fallback_triggered` 字段专门服务于第11周的召回测评，用于分析RRF参数合理性及通路覆盖率 |
 
 
-## 七、📌 版本变更汇总（v1.0 → v3.0）
+## 七、📌 版本变更汇总（v1.0 → v4.0）
 
 | 变更项 | 版本 | 类型 | 紧迫度 | 核心原因 |
 | :--- | :--- | :--- | :--- | :--- |
@@ -437,6 +534,8 @@ fallback_patterns:
 | `kb_tags.tag_category` 增加 `auto_extracted` | v2.0 | 修改 | 低（增强） | 支持路由自动补齐标签，提升过滤准确率 |
 | `kb_sessions` 表 | v3.0 | 新增 | **高** | 支撑多轮指代消解，降低LLM重复传入历史的Token消耗 |
 | `kb_query_logs` 表 | v3.0 | 新增 | **高** | 记录“意图-拆解-改写”全过程，是Bad Case分析和检索评测的数据基石 |
-| `kb_user_feedback` 增加 3 个字段 | v3.0 | 修改 | **高** | 必须区分“改写环节”是否出错，否则端到端闭环无法定位根因 |
+| `kb_user_feedback` 增加 3 个字段（理解层） | v3.0 | 修改 | **高** | 必须区分“改写环节”是否出错，否则端到端闭环无法定位根因 |
 | Nacos `query_understanding.yaml` | v3.0 | 新增 | 中 | 将降级规则与Prompt策略解耦，支持运维随时调整兜底逻辑 |
-```
+| **`kb_search_logs` 表** | **v4.0** | **新增** | **高** | 记录多路召回细节（各通路命中数、RRF参数、延迟、宽松触发），是召回调优与评测的数据基石 |
+| **`kb_user_feedback` 增加 3 个字段（召回层）** | **v4.0** | **修改** | **高** | 让用户反馈可追溯到“召回”环节，区分“没召回”和“召回了但排序差”，定位根因 |
+| **Nacos `search_hybrid.yaml` 配置组** | **v4.0** | **新增** | 中 | RRF权重、top_k、Fallback阈值需要运行时动态调参，避免频繁发版 |
